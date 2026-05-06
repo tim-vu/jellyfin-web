@@ -270,17 +270,9 @@ export class HtmlVideoPlayer {
      */
     #supportedFeatures;
     /**
-     * @type {HTMLVideoElement | null | undefined}
-     */
-    #mediaElement;
-    /**
      * @type {number}
      */
     #fetchQueue = 0;
-    /**
-     * @type {string | undefined}
-     */
-    #currentSrc;
     /**
      * @type {boolean | undefined}
      */
@@ -295,30 +287,127 @@ export class HtmlVideoPlayer {
     #currentTime;
 
     /**
-     * @private (used in other files)
-     * @type {any | undefined}
+     * Whether preloading has been triggered for the current track.
+     * Managed internally — reset on playback start, set on preload.
+     * @type {boolean}
      */
-    _flvPlayer;
+    #preloadTriggered = false;
 
-    /**
-     * @private (used in other files)
-     * @type {any | undefined}
-     */
-    _hlsPlayer;
-    /**
-     * @private (used in other files)
-     * @type {any | null | undefined}
-     */
-    _castPlayer;
-    /**
-     * @private (used in other files)
-     * @type {any | undefined}
-     */
-    _currentPlayOptions;
     /**
      * @type {any | undefined}
      */
     #lastProfile;
+
+    /**
+     * @typedef {Object} VideoState
+     * @property {HTMLVideoElement|null} element
+     * @property {any|null} hlsPlayer
+     * @property {any|null} flvPlayer
+     * @property {any|null} castPlayer
+     * @property {any|null} playOptions
+     * @property {string|null} currentSrc
+     */
+
+    /** @type {VideoState} */
+    #activeState = HtmlVideoPlayer.#createVideoState();
+    /** @type {VideoState} */
+    #preloadState = HtmlVideoPlayer.#createVideoState();
+
+    /**
+     * @returns {VideoState}
+     */
+    static #createVideoState() {
+        return {
+            element: null,
+            hlsPlayer: null,
+            flvPlayer: null,
+            castPlayer: null,
+            playOptions: null,
+            currentSrc: null
+        };
+    }
+
+    /**
+     * Reset a video state's players and options without touching the element.
+     * @param {VideoState} state
+     */
+    static #resetStatePlayers(state) {
+        if (state.hlsPlayer) {
+            try {
+                state.hlsPlayer.destroy();
+            } catch (e) {
+                console.error(e);
+            }
+            state.hlsPlayer = null;
+        }
+        if (state.flvPlayer) {
+            try {
+                state.flvPlayer.unload();
+                state.flvPlayer.detachMediaElement();
+                state.flvPlayer.destroy();
+            } catch (e) {
+                console.error(e);
+            }
+            state.flvPlayer = null;
+        }
+        if (state.castPlayer) {
+            try {
+                state.castPlayer.unload();
+            } catch (e) {
+                console.error(e);
+            }
+            state.castPlayer = null;
+        }
+        state.playOptions = null;
+        state.currentSrc = null;
+    }
+
+    /** @private */
+    get _hlsPlayer() {
+        return this.#activeState.hlsPlayer;
+    }
+    set _hlsPlayer(val) {
+        this.#activeState.hlsPlayer = val;
+    }
+
+    /** @private (used in htmlMediaHelper) */
+    get _flvPlayer() {
+        return this.#activeState.flvPlayer;
+    }
+    set _flvPlayer(val) {
+        this.#activeState.flvPlayer = val;
+    }
+
+    /** @private (used in htmlMediaHelper) */
+    get _castPlayer() {
+        return this.#activeState.castPlayer;
+    }
+    set _castPlayer(val) {
+        this.#activeState.castPlayer = val;
+    }
+
+    /** @private  */
+    get _currentPlayOptions() {
+        return this.#activeState.playOptions;
+    }
+    set _currentPlayOptions(val) {
+        this.#activeState.playOptions = val;
+    }
+
+    get #mediaElement() {
+        return this.#activeState.element;
+    }
+    /** @private  */
+    set #mediaElement(val) {
+        this.#activeState.element = val;
+    }
+
+    get #currentSrc() {
+        return this.#activeState.currentSrc;
+    }
+    set #currentSrc(val) {
+        this.#activeState.currentSrc = val;
+    }
 
     constructor() {
         if (browser.edgeUwp) {
@@ -330,6 +419,54 @@ export class HtmlVideoPlayer {
 
     currentSrc() {
         return this.#currentSrc;
+    }
+
+    getPreloadedPlayOptions() {
+        return this.#preloadState.playOptions;
+    }
+
+    /**
+     * Check if the given item has been preloaded and is ready for seamless transition.
+     */
+    isPreloaded(item, mediaSource) {
+        const preloadOpts = this.#preloadState.playOptions;
+
+        if (!this.#preloadState.element || !preloadOpts || preloadOpts.item?.Id !== item?.Id) {
+            return false;
+        }
+
+        if (mediaSource && preloadOpts.mediaSource?.Id !== mediaSource.Id) {
+            return false;
+        }
+        return true;
+    }
+
+    isPreloadTriggered() {
+        return this.#preloadTriggered;
+    }
+
+    /**
+     * @private
+     */
+    #createVideoElement({ preload = 'metadata', autoplay = false, controls = false } = {}) {
+        const elem = document.createElement('video');
+        elem.classList.add('htmlvideoplayer');
+        elem.preload = preload;
+        elem.setAttribute('webkit-playsinline', '');
+        elem.setAttribute('playsinline', '');
+
+        if (autoplay) {
+            elem.autoplay = true;
+        }
+        if (controls) {
+            elem.setAttribute('controls', 'controls');
+        }
+
+        if (!appHost.supports(AppFeature.PhysicalVolumeControl)) {
+            elem.volume = getSavedVolume();
+        }
+
+        return elem;
     }
 
     /**
@@ -398,8 +535,18 @@ export class HtmlVideoPlayer {
         this.#timeUpdated = false;
 
         this.#currentTime = null;
+        this.#preloadTriggered = false;
 
         if (options.resetSubtitleOffset !== false) this.resetSubtitleOffset();
+
+        // Check if we have a preloaded element matching this item
+        if (this.isPreloaded(options.item, options.mediaSource)) {
+            console.debug('htmlVideoPlayer: using preloaded element for seamless transition');
+            return this.#swapToPreloaded(options);
+        }
+
+        // Destroy any stale preload that didn't match
+        this.destroyPreload();
 
         const elem = await this.createMediaElement(options);
         this.#applyAspectRatio(options.aspectRatio || this.getAspectRatio());
@@ -409,35 +556,214 @@ export class HtmlVideoPlayer {
     }
 
     /**
+     * Bind playback event listeners to a video element.
      * @private
      */
-    setSrcWithFlvJs(elem, options, url) {
+    #bindEventListeners(elem) {
+        elem.addEventListener('timeupdate', this.onTimeUpdate);
+        elem.addEventListener('ended', this.onEnded);
+        elem.addEventListener('volumechange', this.onVolumeChange);
+        elem.addEventListener('pause', this.onPause);
+        elem.addEventListener('playing', this.onPlaying);
+        elem.addEventListener('play', this.onPlay);
+        elem.addEventListener('click', this.onClick);
+        elem.addEventListener('dblclick', this.onDblClick);
+        elem.addEventListener('waiting', this.onWaiting);
+    }
+
+    /**
+     * Unbind playback event listeners from a video element.
+     * @private
+     */
+    #unbindEventListeners(elem) {
+        elem.removeEventListener('timeupdate', this.onTimeUpdate);
+        elem.removeEventListener('ended', this.onEnded);
+        elem.removeEventListener('volumechange', this.onVolumeChange);
+        elem.removeEventListener('pause', this.onPause);
+        elem.removeEventListener('playing', this.onPlaying);
+        elem.removeEventListener('play', this.onPlay);
+        elem.removeEventListener('click', this.onClick);
+        elem.removeEventListener('dblclick', this.onDblClick);
+        elem.removeEventListener('waiting', this.onWaiting);
+        elem.removeEventListener('error', this.onError);
+    }
+
+    /**
+     * Configure subtitle and audio track indices from media source options.
+     * @private
+     */
+    #configureTrackIndices(options) {
+        let secondaryTrackValid = true;
+
+        this.#subtitleTrackIndexToSetOnPlaying = options.mediaSource.DefaultSubtitleStreamIndex == null ? -1 : options.mediaSource.DefaultSubtitleStreamIndex;
+        if (this.#subtitleTrackIndexToSetOnPlaying != null && this.#subtitleTrackIndexToSetOnPlaying >= 0) {
+            const initialSubtitleStream = options.mediaSource.MediaStreams[this.#subtitleTrackIndexToSetOnPlaying];
+            if (!initialSubtitleStream || initialSubtitleStream.DeliveryMethod === 'Encode') {
+                this.#subtitleTrackIndexToSetOnPlaying = -1;
+                secondaryTrackValid = false;
+            }
+            // secondary track should not be shown if primary track is no longer a valid pair
+            if (initialSubtitleStream && !playbackManager.trackHasSecondarySubtitleSupport(initialSubtitleStream, this)) {
+                secondaryTrackValid = false;
+            }
+        } else {
+            secondaryTrackValid = false;
+        }
+
+        this.#audioTrackIndexToSetOnPlaying = options.playMethod === 'Transcode' ? null : options.mediaSource.DefaultAudioStreamIndex;
+
+        if (secondaryTrackValid) {
+            this.#secondarySubtitleTrackIndexToSetOnPlaying = options.mediaSource.DefaultSecondarySubtitleStreamIndex == null ? -1 : options.mediaSource.DefaultSecondarySubtitleStreamIndex;
+            if (this.#secondarySubtitleTrackIndexToSetOnPlaying != null && this.#secondarySubtitleTrackIndexToSetOnPlaying >= 0) {
+                const initialSecondarySubtitleStream = options.mediaSource.MediaStreams[this.#secondarySubtitleTrackIndexToSetOnPlaying];
+                if (!initialSecondarySubtitleStream || !playbackManager.trackHasSecondarySubtitleSupport(initialSecondarySubtitleStream, this)) {
+                    this.#secondarySubtitleTrackIndexToSetOnPlaying = -1;
+                }
+            }
+        } else {
+            this.#secondarySubtitleTrackIndexToSetOnPlaying = -1;
+        }
+    }
+
+    /**
+     * Preload the next video into a hidden element for seamless transition.
+     * @param {object} options - Stream info for the next item (same shape as play() options).
+     */
+    async preload(options) {
+        // Don't preload if already preloading the same item
+        if (this.#preloadState.playOptions?.item?.Id === options.item?.Id &&
+            this.#preloadState.playOptions?.mediaSource?.Id === options.mediaSource?.Id) {
+            return;
+        }
+
+        // Clean up any previous preload state (keep element in DOM)
+        this.destroyPreload();
+
+        const dlg = this.#videoDialog;
+        if (!dlg) {
+            console.warn('htmlVideoPlayer: no video dialog for preload');
+            return;
+        }
+
+        console.debug('htmlVideoPlayer: preloading next video');
+
+        // Reuse existing preload element or create one
+        let preloadElem = this.#preloadState.element;
+        if (!preloadElem) {
+            preloadElem = this.#createVideoElement({ preload: 'auto' });
+            preloadElem.hidden = true;
+            dlg.appendChild(preloadElem);
+            this.#preloadState.element = preloadElem;
+        }
+
+        this.#activeState.element.removeAttribute('poster');
+
+        preloadElem.preload = 'auto';
+        preloadElem.hidden = true;
+        preloadElem.muted = this.#activeState.element?.muted || false;
+
+        this.#preloadState.playOptions = options;
+        this.#preloadTriggered = true;
+
+        // Set up src on the preload element (reuse setCurrentSrc without starting playback)
+        await this.setCurrentSrc(preloadElem, options, {
+            startPlayback: false,
+            state: this.#preloadState
+        });
+    }
+
+    /**
+     * Swap the preloaded element in as the active video element.
+     * @private
+     */
+    async #swapToPreloaded(options) {
+        // Hide any loading spinner immediately — content is already buffered
+        loading.hide();
+
+        const oldElem = this.#activeState.element;
+        const newElem = this.#preloadState.element;
+
+        // Tear down old active element
+        if (oldElem) {
+            oldElem.pause();
+
+            this.#unbindEventListeners(oldElem);
+            this.destroyCustomTrack(oldElem);
+
+            HtmlVideoPlayer.#resetStatePlayers(this.#activeState);
+            resetSrc(oldElem);
+            oldElem.hidden = true;
+        }
+
+        // Promote preloaded element
+        newElem.hidden = false;
+        this.#bindEventListeners(newElem);
+
+        // Swap state references: preload becomes active, old active becomes preload
+        const temp = this.#activeState;
+        this.#activeState = this.#preloadState;
+        this.#preloadState = temp;
+
+        // Update options on the now-active state
+        this._currentPlayOptions = options;
+        this.#currentSrc = options.url;
+
+        this.#configureTrackIndices(options);
+        this.#applyAspectRatio(options.aspectRatio || this.getAspectRatio());
+
+        // Start playback — content is already buffered so this should be near-instant
+        newElem.autoplay = true;
+        return playWithPromise(newElem, this.onError);
+    }
+
+    /**
+     * Clean up preload state players and src, but keep the element in the DOM.
+     */
+    destroyPreload() {
+        const preloadElem = this.#preloadState.element;
+        if (preloadElem) {
+            preloadElem.pause();
+            resetSrc(preloadElem);
+            preloadElem.hidden = true;
+        }
+
+        HtmlVideoPlayer.#resetStatePlayers(this.#preloadState);
+    }
+
+    /**
+     * @private
+     */
+    setSrcWithFlvJs(elem, options, url, { startPlayback = true, state = null } = {}) {
+        const targetState = state || this.#activeState;
         return import('flv.js').then(({ default: flvjs }) => {
             const flvPlayer = flvjs.createPlayer({
                 type: 'flv',
                 url: url
             },
-            {
-                seekType: 'range',
-                lazyLoad: false
-            });
+                {
+                    seekType: 'range',
+                    lazyLoad: false
+                });
 
             flvPlayer.attachMediaElement(elem);
             flvPlayer.load();
 
-            this._flvPlayer = flvPlayer;
+            targetState.flvPlayer = flvPlayer;
 
             // This is needed in setCurrentTrackElement
-            this.#currentSrc = url;
+            targetState.currentSrc = url;
 
-            return flvPlayer.play();
+            if (startPlayback) {
+                return flvPlayer.play();
+            }
         });
     }
 
     /**
      * @private
      */
-    setSrcWithHlsJs(elem, options, url) {
+    setSrcWithHlsJs(elem, options, url, { startPlayback = true, state = null } = {}) {
+        const targetState = state || this.#activeState;
         return new Promise((resolve, reject) => {
             requireHlsPlayer(async () => {
                 let maxBufferLength = 30;
@@ -465,12 +791,18 @@ export class HtmlVideoPlayer {
                 hls.loadSource(url);
                 hls.attachMedia(elem);
 
-                bindEventsToHlsPlayer(this, hls, elem, this.onError, resolve, reject);
+                targetState.hlsPlayer = hls;
 
-                this._hlsPlayer = hls;
+                if (startPlayback) {
+                    bindEventsToHlsPlayer(this, hls, elem, this.onError, resolve, reject);
+                }
 
                 // This is needed in setCurrentTrackElement
-                this.#currentSrc = url;
+                targetState.currentSrc = url;
+
+                if (!startPlayback) {
+                    resolve();
+                }
             });
         });
     }
@@ -478,11 +810,13 @@ export class HtmlVideoPlayer {
     /**
      * @private
      */
-    async setCurrentSrc(elem, options) {
+    async setCurrentSrc(elem, options, { startPlayback = true, state = null } = {}) {
+        const targetState = state || this.#activeState;
+
         elem.removeEventListener('error', this.onError);
 
         let val = options.url;
-        console.debug(`playing url: ${val}`);
+        console.debug(`${startPlayback ? 'playing' : 'preloading'} url: ${val}`);
 
         // Convert to seconds
         const seconds = (options.playerStartPositionTicks || 0) / 10000000;
@@ -490,41 +824,14 @@ export class HtmlVideoPlayer {
             val += `#t=${seconds}`;
         }
 
-        destroyHlsPlayer(this);
-        destroyFlvPlayer(this);
-        destroyCastPlayer(this);
+        if (startPlayback) {
+            destroyHlsPlayer(this);
+            destroyFlvPlayer(this);
+            destroyCastPlayer(this);
 
-        let secondaryTrackValid = true;
+            this.#configureTrackIndices(options);
 
-        this.#subtitleTrackIndexToSetOnPlaying = options.mediaSource.DefaultSubtitleStreamIndex == null ? -1 : options.mediaSource.DefaultSubtitleStreamIndex;
-        if (this.#subtitleTrackIndexToSetOnPlaying != null && this.#subtitleTrackIndexToSetOnPlaying >= 0) {
-            const initialSubtitleStream = options.mediaSource.MediaStreams[this.#subtitleTrackIndexToSetOnPlaying];
-            if (!initialSubtitleStream || initialSubtitleStream.DeliveryMethod === 'Encode') {
-                this.#subtitleTrackIndexToSetOnPlaying = -1;
-                secondaryTrackValid = false;
-            }
-            // secondary track should not be shown if primary track is no longer a valid pair
-            if (initialSubtitleStream && !playbackManager.trackHasSecondarySubtitleSupport(initialSubtitleStream, this)) {
-                secondaryTrackValid = false;
-            }
-        } else {
-            secondaryTrackValid = false;
-        }
-
-        this.#audioTrackIndexToSetOnPlaying = options.playMethod === 'Transcode' ? null : options.mediaSource.DefaultAudioStreamIndex;
-
-        this._currentPlayOptions = options;
-
-        if (secondaryTrackValid) {
-            this.#secondarySubtitleTrackIndexToSetOnPlaying = options.mediaSource.DefaultSecondarySubtitleStreamIndex == null ? -1 : options.mediaSource.DefaultSecondarySubtitleStreamIndex;
-            if (this.#secondarySubtitleTrackIndexToSetOnPlaying != null && this.#secondarySubtitleTrackIndexToSetOnPlaying >= 0) {
-                const initialSecondarySubtitleStream = options.mediaSource.MediaStreams[this.#secondarySubtitleTrackIndexToSetOnPlaying];
-                if (!initialSecondarySubtitleStream || !playbackManager.trackHasSecondarySubtitleSupport(initialSecondarySubtitleStream, this)) {
-                    this.#secondarySubtitleTrackIndexToSetOnPlaying = -1;
-                }
-            }
-        } else {
-            this.#secondarySubtitleTrackIndexToSetOnPlaying = -1;
+            this._currentPlayOptions = options;
         }
 
         const crossOrigin = getCrossOriginValue(options.mediaSource);
@@ -533,11 +840,13 @@ export class HtmlVideoPlayer {
         }
 
         if (enableHlsJsPlayerForCodecs(options.mediaSource, 'Video') && isHls(options.mediaSource)) {
-            return this.setSrcWithHlsJs(elem, options, val);
+            return this.setSrcWithHlsJs(elem, options, val, { startPlayback, state: targetState });
         } else if (options.playMethod !== 'Transcode' && options.mediaSource.Container?.toUpperCase() === 'FLV') {
-            return this.setSrcWithFlvJs(elem, options, val);
+            return this.setSrcWithFlvJs(elem, options, val, { startPlayback, state: targetState });
         } else {
-            elem.autoplay = true;
+            if (startPlayback) {
+                elem.autoplay = true;
+            }
 
             const includeCorsCredentials = await getIncludeCorsCredentials();
             if (includeCorsCredentials) {
@@ -546,9 +855,11 @@ export class HtmlVideoPlayer {
             }
 
             return applySrc(elem, val, options).then(() => {
-                this.#currentSrc = val;
+                targetState.currentSrc = val;
 
-                return playWithPromise(elem, this.onError);
+                if (startPlayback) {
+                    return playWithPromise(elem, this.onError);
+                }
             });
         }
     }
@@ -761,8 +1072,8 @@ export class HtmlVideoPlayer {
 
         return profiles.some(function (p) {
             return p.Type === 'Video'
-                    && includesAny((p.Container || '').toLowerCase(), container)
-                    && includesAny((p.AudioCodec || '').toLowerCase(), codec);
+                && includesAny((p.Container || '').toLowerCase(), container)
+                && includesAny((p.AudioCodec || '').toLowerCase(), codec);
         });
     }
 
@@ -850,33 +1161,20 @@ export class HtmlVideoPlayer {
     destroy() {
         this.setSubtitleOffset.cancel();
 
-        destroyHlsPlayer(this);
-        destroyFlvPlayer(this);
+        // Clean up both video states
+        for (const state of [this.#activeState, this.#preloadState]) {
+            if (state.element) {
+                this.#unbindEventListeners(state.element);
+                this.destroyCustomTrack(state.element);
+                resetSrc(state.element);
+                state.element.parentNode?.removeChild(state.element);
+                state.element = null;
+            }
+            HtmlVideoPlayer.#resetStatePlayers(state);
+        }
 
         setBackdropTransparency(TRANSPARENCY_LEVEL.None);
         document.body.classList.remove('hide-scroll');
-
-        const videoElement = this.#mediaElement;
-
-        if (videoElement) {
-            this.#mediaElement = null;
-
-            this.destroyCustomTrack(videoElement);
-            videoElement.removeEventListener('timeupdate', this.onTimeUpdate);
-            videoElement.removeEventListener('ended', this.onEnded);
-            videoElement.removeEventListener('volumechange', this.onVolumeChange);
-            videoElement.removeEventListener('pause', this.onPause);
-            videoElement.removeEventListener('playing', this.onPlaying);
-            videoElement.removeEventListener('play', this.onPlay);
-            videoElement.removeEventListener('click', this.onClick);
-            videoElement.removeEventListener('dblclick', this.onDblClick);
-            videoElement.removeEventListener('waiting', this.onWaiting);
-            videoElement.removeEventListener('error', this.onError); // bound in htmlMediaHelper
-
-            resetSrc(videoElement);
-
-            videoElement.parentNode.removeChild(videoElement);
-        }
 
         const dlg = this.#videoDialog;
         if (dlg) {
@@ -1609,106 +1907,56 @@ export class HtmlVideoPlayer {
     /**
      * @private
      */
-    createMediaElement(options) {
+    async createMediaElement(options) {
         const dlg = document.querySelector('.videoPlayerContainer');
 
         if (!dlg) {
-            return import('./style.scss').then(() => {
-                if (options.fullscreen) loading.show();
+            await import('./style.scss');
 
-                const playerDlg = document.createElement('div');
-                playerDlg.setAttribute('dir', 'ltr');
-                playerDlg.classList.add('videoPlayerContainer');
-                if (options.fullscreen) {
-                    playerDlg.classList.add('videoPlayerContainer-onTop');
-                }
-
-                let html = '';
-                const cssClass = 'htmlvideoplayer';
-
-                // Can't autoplay in these browsers so we need to use the full controls, at least until playback starts
-                if (!appHost.supports(AppFeature.HtmlVideoAutoplay)) {
-                    html += '<video class="' + cssClass + '" preload="metadata" autoplay="autoplay" controls="controls" webkit-playsinline playsinline>';
-                } else if (browser.web0s) {
-                    // in webOS, setting preload auto allows resuming videos
-                    html += '<video class="' + cssClass + '" preload="auto" autoplay="autoplay" webkit-playsinline playsinline>';
-                } else {
-                    // Chrome 35 won't play with preload none
-                    html += '<video class="' + cssClass + '" preload="metadata" autoplay="autoplay" webkit-playsinline playsinline>';
-                }
-
-                html += '</video>';
-
-                playerDlg.innerHTML = html;
-                const videoElement = playerDlg.querySelector('video');
-
-                // TODO: Move volume control to PlaybackManager. Player should just be a wrapper that translates commands into API calls.
-                if (!appHost.supports(AppFeature.PhysicalVolumeControl)) {
-                    videoElement.volume = getSavedVolume();
-                }
-
-                videoElement.addEventListener('timeupdate', this.onTimeUpdate);
-                videoElement.addEventListener('ended', this.onEnded);
-                videoElement.addEventListener('volumechange', this.onVolumeChange);
-                videoElement.addEventListener('pause', this.onPause);
-                videoElement.addEventListener('playing', this.onPlaying);
-                videoElement.addEventListener('play', this.onPlay);
-                videoElement.addEventListener('click', this.onClick);
-                videoElement.addEventListener('dblclick', this.onDblClick);
-                videoElement.addEventListener('waiting', this.onWaiting);
-                if (options.backdropUrl) {
-                    videoElement.poster = options.backdropUrl;
-                }
-
-                document.body.insertBefore(playerDlg, document.body.firstChild);
-                this.#videoDialog = playerDlg;
-                this.#mediaElement = videoElement;
-
-                delete this.forcedFullscreen;
-
-                if (options.fullscreen) {
-                    // At this point, we must hide the scrollbar placeholder, so it's not being displayed while the item is being loaded
-                    document.body.classList.add('hide-scroll');
-
-                    // Enter fullscreen in the webOS browser to hide the top bar
-                    if (!window.NativeShell && browser.web0s && Screenfull.isEnabled) {
-                        Screenfull.request().then(() => {
-                            this.forcedFullscreen = true;
-                        });
-                        return videoElement;
-                    }
-
-                    // don't animate on smart tv's, too slow
-                    if (!browser.slow && browser.supportsCssAnimation()) {
-                        return zoomIn(playerDlg).then(function () {
-                            return videoElement;
-                        });
-                    }
-                }
-
-                return videoElement;
-            });
-        } else {
+            if (options.fullscreen) loading.show();
+            const playerDlg = document.createElement('div');
+            playerDlg.setAttribute('dir', 'ltr');
+            playerDlg.classList.add('videoPlayerContainer');
             if (options.fullscreen) {
-                // we need to hide scrollbar when starting playback from page with animated background
-                document.body.classList.add('hide-scroll');
-
-                // Enter fullscreen in the webOS browser to hide the top bar
-                if (!this.forcedFullscreen && !window.NativeShell && browser.web0s && Screenfull.isEnabled) {
-                    Screenfull.request().then(() => {
-                        this.forcedFullscreen = true;
-                    });
-                }
+                playerDlg.classList.add('videoPlayerContainer-onTop');
             }
-
-            const videoElement = dlg.querySelector('video');
+            // Can't autoplay in these browsers so we need to use the full controls, at least until playback starts
+            const needsControls = !appHost.supports(AppFeature.HtmlVideoAutoplay);
+            const preloadValue = browser.web0s ? 'auto' : 'metadata';
+            const videoElement = this.#createVideoElement({
+                preload: preloadValue,
+                autoplay: true,
+                controls: needsControls
+            });
+            this.#bindEventListeners(videoElement);
             if (options.backdropUrl) {
-                // update backdrop image
                 videoElement.poster = options.backdropUrl;
             }
+            playerDlg.appendChild(videoElement);
+            document.body.insertBefore(playerDlg, document.body.firstChild);
+            this.#videoDialog = playerDlg;
+            this.#mediaElement = videoElement;
 
-            return Promise.resolve(videoElement);
+            return videoElement;
         }
+
+        let elem = this.#mediaElement;
+        if (!elem) {
+            elem = this.#createVideoElement({
+                preload: browser.web0s ? 'auto' : 'metadata',
+                autoplay: true
+            });
+            dlg.appendChild(elem);
+            this.#mediaElement = elem;
+        }
+
+        const poster = playbackManager.getPosterUrl(options.item);
+        if (poster) {
+            elem.setAttribute('poster', poster);
+        }
+
+        this.#bindEventListeners(elem);
+        return Promise.resolve(elem);
     }
 
     /**
@@ -1888,11 +2136,11 @@ export class HtmlVideoPlayer {
         if (document.AirPlayEnabled) {
             if (video) {
                 if (isEnabled) {
-                    video.requestAirPlay().catch(function(err) {
+                    video.requestAirPlay().catch(function (err) {
                         console.error('Error requesting AirPlay', err);
                     });
                 } else {
-                    document.exitAirPLay().catch(function(err) {
+                    document.exitAirPLay().catch(function (err) {
                         console.error('Error exiting AirPlay', err);
                     });
                 }

@@ -2271,16 +2271,16 @@ export class PlaybackManager {
             const getItemAndParts = async function (item) {
                 if (
                     item.PartCount && item.PartCount > 1
-                    && [ BaseItemKind.Episode, BaseItemKind.Movie ].includes(item.Type)
+                    && [BaseItemKind.Episode, BaseItemKind.Movie].includes(item.Type)
                 ) {
                     const client = ServerConnections.getApiClient(item.ServerId);
                     const user = await client.getCurrentUser();
                     const additionalParts = await client.getAdditionalVideoParts(user.Id, item.Id);
                     if (additionalParts.Items.length) {
-                        return [ item, ...additionalParts.Items ];
+                        return [item, ...additionalParts.Items];
                     }
                 }
-                return [ item ];
+                return [item];
             };
 
             return Promise.all(items.map(getItemAndParts));
@@ -2366,7 +2366,10 @@ export class PlaybackManager {
             const mediaType = item.MediaType;
 
             if (playOptions.fullscreen) {
-                loading.show();
+                // Skip loading spinner if the current player has preloaded content for this item
+                if (!self._currentPlayer.isPreloaded(item)) {
+                    loading.show();
+                }
             }
 
             return runInterceptors(item, playOptions)
@@ -2957,7 +2960,7 @@ export class PlaybackManager {
                                 });
                             } else {
                                 if (item.AlbumId != null) {
-                                    return apiClient.getItem(apiClient.getCurrentUserId(), item.AlbumId).then(function(result) {
+                                    return apiClient.getItem(apiClient.getCurrentUserId(), item.AlbumId).then(function (result) {
                                         mediaSource.albumNormalizationGain = result.NormalizationGain;
                                         return mediaSource;
                                     });
@@ -3550,6 +3553,34 @@ export class PlaybackManager {
         function onPlaybackTimeUpdate() {
             const player = this;
             sendProgressUpdate(player, 'timeupdate');
+            maybePreloadNextItem(player);
+        }
+
+        function maybePreloadNextItem(player) {
+            if (!self._playNextAfterEnded) return;
+            if (player.isPreloadTriggered?.()) return;
+            if (!player.preload) return;
+
+            const duration = player.duration?.();
+            const currentTime = player.currentTime?.();
+            if (!duration || !currentTime) return;
+
+            const remainingMs = duration - currentTime;
+            if (remainingMs > 30000 || remainingMs < 0) return;
+
+            const nextItemInfo = self._playQueueManager.getNextItemInfo();
+            if (!nextItemInfo?.item) return;
+
+            console.debug('playbackmanager: preloading next item, remaining: ' + Math.round(remainingMs) + 'ms');
+
+            self.getPlaybackInfo(nextItemInfo.item).then(function (streamInfo) {
+                if (player.preload) {
+                    streamInfo.fullscreen = true;
+                    player.preload(streamInfo);
+                }
+            }).catch(function (err) {
+                console.warn('playbackmanager: preload failed, will use normal load', err);
+            });
         }
 
         function onPlaybackPause() {
